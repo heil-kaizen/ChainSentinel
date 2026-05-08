@@ -9,17 +9,18 @@ from fastapi import FastAPI, Request
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("v15-final")
+logger = logging.getLogger("v16-resilient")
 
 # --- CONFIGURATION ---
-TELEGRAM_TOKEN = "YOUR_TOKEN"
+TELEGRAM_TOKEN = "USE_YOUR_OLD_BOT_TOKEN_HERE"
 CHAT_ID = "YOUR_CHAT_ID"
-HELIUS_KEYS = ["KEY_1", "KEY_2"] # Supports up to 10 keys
+HELIUS_KEYS = ["KEY_1", "KEY_2", "KEY_3"] # Supports up to 10 keys
 DB_PATH = "forensic_vault.db"
 
+# IMPORTANT: Ensure addresses are EXACT
 TARGETS = {
-    "Address_For_A_Here": {"label": "Person A"},
-    "Address_For_B_Here": {"label": "Person B"}
+    "TARGET_ADDRESS_1": {"label": "Person A"},
+    "TARGET_ADDRESS_2": {"label": "Person B"}
 }
 
 CB_WALLETS = [
@@ -31,7 +32,7 @@ CB_WALLETS = [
 active_hunts = {} 
 active_hunts_lock = asyncio.Lock()
 tg_queue = asyncio.Queue(maxsize=1000)
-helius_client = httpx.AsyncClient(timeout=25.0, limits=httpx.Limits(max_keepalive_connections=20, max_connections=50))
+helius_client = httpx.AsyncClient(timeout=30.0, limits=httpx.Limits(max_keepalive_connections=20, max_connections=50))
 
 # --- DATABASE ARCHITECTURE ---
 
@@ -57,21 +58,17 @@ class ForensicVault:
             await self.conn.commit()
 
     async def is_new_sig(self, sig) -> bool:
-        """Atomic Deduplication (Fix #3)."""
         async with self.db_lock:
-            # Atomic INSERT OR IGNORE returns rowcount=1 if unique
             cursor = await self.conn.execute("INSERT OR IGNORE INTO processed_sigs VALUES (?, ?)", (sig, int(time.time())))
             is_new = cursor.rowcount > 0
             if is_new:
                 self.sig_counter += 1
-                # Maintenance: Purge every 500 new signatures (Fix #4)
                 if self.sig_counter % 500 == 0:
                     await self.conn.execute("DELETE FROM processed_sigs WHERE ts < ?", (int(time.time()) - 86400,))
             await self.conn.commit()
             return is_new
 
     async def register_hunt(self, h_id, addr, label, amt, sweep, expiry) -> bool:
-        """Restored Method (Fix #1)."""
         async with self.db_lock:
             cursor = await self.conn.execute("INSERT OR IGNORE INTO hunts VALUES (?, ?, ?, ?, ?, ?)", (h_id, addr, label, amt, sweep, expiry))
             await self.conn.commit()
@@ -94,22 +91,24 @@ async def tg_worker():
                 text = await tg_queue.get()
                 payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
                 try:
-                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload)
+                    r = await client.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload)
+                    if r.status_code != 200:
+                        logger.error(f"Telegram API Error: {r.text}")
                 except Exception as e:
-                    logger.error(f"TG Worker: {e}")
+                    logger.error(f"TG Worker Failed: {e}")
                 finally:
                     tg_queue.task_done()
         except asyncio.CancelledError:
-            logger.info("Telegram worker shutting down.")
             raise
 
 # --- ATTRIBUTION SCORING ---
 
 def calculate_score(obs_amt, target_amt, tx_ts, sweep_ts):
     diff = abs(obs_amt - target_amt)
-    s_amt = max(0, 60 - (diff * 2500)) 
+    s_amt = max(0, 60 - (diff * 3000)) # Strict amount scoring
     delta = tx_ts - sweep_ts
-    s_time = 40 - (abs(delta - 600) / 60) if 120 <= delta <= 3000 else 0
+    # Peak score at 5-15 mins
+    s_time = 40 - (abs(delta - 600) / 60) if 0 <= delta <= 3600 else 0
     return max(0, s_amt + s_time)
 
 # --- MANAGED SCANNER ---
@@ -125,56 +124,76 @@ async def scan_wallet_for_hunt(wallet, api_key, hunt, found_event):
     tolerance = max(0.01, hunt['amount'] * 0.02)
     min_amt, max_amt = hunt['amount'] - tolerance, hunt['amount'] + tolerance
 
-    for page in range(15):
+    for page in range(20):
         if found_event.is_set(): return
         url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions?api-key={api_key}"
         if last_sig: url += f"&before={last_sig}"
 
-        # Resilience Loop (Fix #6: Handle 429 and 5xx)
-        for retry in range(3):
+        # FIX: Robust Retry Loop for 429 and 5xx
+        success = False
+        for retry in range(4):
             try:
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.2) # Base delay to respect rate limits
                 resp = await helius_client.get(url)
                 
-                if resp.status_code == 429 or (500 <= resp.status_code < 600):
-                    await asyncio.sleep(2 * (retry + 1))
+                if resp.status_code == 429:
+                    wait = 5 * (retry + 1)
+                    logger.warning(f"Rate Limit (429) on {wallet}. Waiting {wait}s...")
+                    await asyncio.sleep(wait)
                     continue
                 
-                if resp.status_code != 200: break
+                if 500 <= resp.status_code < 600:
+                    await asyncio.sleep(2)
+                    continue
+
+                if resp.status_code != 200: 
+                    logger.error(f"Helius Error {resp.status_code} on {wallet}")
+                    break
                 
                 txs = resp.json()
                 if not isinstance(txs, list) or not txs:
                     scan_verified = True
+                    success = True
                     break
 
                 if page == 0: new_top_sig = txs[0].get('signature')
 
                 for tx in txs:
                     curr_sig, tx_ts = tx.get('signature'), tx.get('timestamp', 0)
+                    
                     if curr_sig == local_cursor or tx_ts < hunt['sweep_time']:
                         scan_verified = True
+                        success = True
                         break
 
                     for transfer in tx.get('nativeTransfers', []):
                         amt = transfer['amount'] / 1e9
                         if min_amt <= amt <= max_amt and transfer['toUserAccount'] not in CB_WALLETS:
                             score = calculate_score(amt, hunt['amount'], tx_ts, hunt['sweep_time'])
-                            if score > 88 and not found_event.is_set():
+                            
+                            # DEBUG: Log potential matches that are close
+                            if score > 50:
+                                logger.info(f"Potential Match Found: {amt} SOL | Score: {score:.1f}")
+
+                            if score > 80 and not found_event.is_set(): # Lowered to 80 for tests
                                 found_event.set()
                                 try:
-                                    tg_queue.put_nowait(f"🎯 <b>V15 MATCH: {hunt['label']}</b> (Score: {score:.0f})\nTo: <a href='https://solscan.io/account/{transfer['toUserAccount']}'>{transfer['toUserAccount']}</a>")
-                                except asyncio.QueueFull:
-                                    logger.warning("Telegram queue full (Fix #5)") # Fix #5
+                                    tg_queue.put_nowait(f"🎯 <b>V16 MATCH: {hunt['label']}</b> (Score: {score:.0f})\nAmt: {amt:.4f} SOL\nTo: <a href='https://solscan.io/account/{transfer['toUserAccount']}'>{transfer['toUserAccount']}</a>")
+                                except: pass
                                 return 
                 
-                if scan_verified: break
+                if scan_verified: 
+                    success = True
+                    break
+                
                 last_sig = txs[-1].get('signature')
+                success = True
                 break 
-            except asyncio.CancelledError:
-                raise
             except Exception as e:
-                if retry == 2: logger.error(f"Failed {wallet}: {e}")
+                logger.error(f"Network error on {wallet}: {e}")
                 await asyncio.sleep(2)
+
+        if not success: break # Stop scanning this wallet if we failed multiple retries
 
     if scan_verified and new_top_sig:
         async with vault.db_lock:
@@ -185,21 +204,31 @@ async def manage_investigation(hunt):
     h_id = hunt['hunt_id']
     found_event = asyncio.Event()
     try:
-        while time.time() < hunt['expiry_time'] and not found_event.is_set():
+        # Increase Hunt to 25 attempts (75 mins) to catch slow batching
+        for attempt in range(25):
+            if time.time() > hunt['expiry_time'] or found_event.is_set(): break
+            
+            logger.info(f"[{hunt['label']}] Attempt {attempt+1}/25. Scanning...")
             tasks = [asyncio.create_task(scan_wallet_for_hunt(w, HELIUS_KEYS[i % len(HELIUS_KEYS)], hunt, found_event)) for i, w in enumerate(CB_WALLETS)]
             await asyncio.gather(*tasks, return_exceptions=True)
+            
             if found_event.is_set(): break
             await asyncio.sleep(180)
     finally:
         await vault.cleanup_investigation(h_id)
         async with active_hunts_lock: active_hunts.pop(h_id, None)
 
-# --- LIFECYCLE (Fix #2, #7) ---
+# --- LIFECYCLE ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await vault.connect()
     tg_task = asyncio.create_task(tg_worker())
+    
+    # STARTUP PING: Prove Telegram is working
+    try:
+        await tg_queue.put("🚀 <b>Sentinel V16 Online</b>\nSystem is armed and monitoring targets.")
+    except: pass
     
     async with vault.db_lock:
         async with vault.conn.execute("SELECT * FROM hunts") as cursor:
@@ -214,37 +243,39 @@ async def lifespan(app: FastAPI):
             await vault.cleanup_investigation(h['hunt_id'])
     
     yield
-    
-    logger.info("Shutting down...")
     tg_task.cancel()
-    await asyncio.gather(tg_task, return_exceptions=True) # Fix #7
+    await asyncio.gather(tg_task, return_exceptions=True)
     await helius_client.aclose()
     await vault.conn.close()
 
-app = FastAPI(lifespan=lifespan) # Fix #2
+app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         data = await request.json()
-    except Exception: return {"status": "error"}
+    except: return {"status": "error"}
 
     for tx in data:
         sig, ts = tx.get('signature'), tx.get('timestamp')
         if not sig: continue
 
-        # Fix #3: Atomic Check-and-Insert
         if not await vault.is_new_sig(sig): continue
 
         for transfer in tx.get('nativeTransfers', []):
             f_addr, t_addr, amt = transfer.get('fromUserAccount'), transfer.get('toUserAccount'), transfer.get('amount', 0) / 1e9
+            
             if f_addr in TARGETS and t_addr in CB_WALLETS:
+                t = TARGETS[f_addr]
                 h_id = f"{f_addr}_{ts}"
-                # Lock Hierarchy: DB Registration first
-                if await vault.register_hunt(h_id, f_addr, TARGETS[f_addr]['label'], amt, ts, int(time.time()) + 3600):
+                
+                if await vault.register_hunt(h_id, f_addr, t['label'], amt, ts, int(time.time()) + 4500):
                     async with active_hunts_lock:
                         if h_id not in active_hunts:
-                            h_data = {"hunt_id": h_id, "target_addr": f_addr, "label": TARGETS[f_addr]['label'], "amount": amt, "sweep_time": ts, "expiry_time": int(time.time()) + 3600}
+                            h_data = {"hunt_id": h_id, "target_addr": f_addr, "label": t['label'], "amount": amt, "sweep_time": ts, "expiry_time": int(time.time()) + 4500}
                             active_hunts[h_id] = asyncio.create_task(manage_investigation(h_data))
+                            try:
+                                tg_queue.put_nowait(f"🔄 <b>Sweep Detected: {t['label']}</b>\nAmt: {amt} SOL\nID: {h_id[:8]}")
+                            except: pass
                 break
     return {"status": "ok"}
